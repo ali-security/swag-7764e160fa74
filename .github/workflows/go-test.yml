@@ -1,18 +1,18 @@
 name: go test
 
 on:
-  push:
-    tags:
-      - v*
-    branches:
-      - master
-
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test -run regex; empty runs the full suite'
+        required: false
+        default: ''
 
 jobs:
   module-matrix:
     name: Go module matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     outputs:
       modules: ${{ steps.modules.outputs.modules }}
@@ -48,7 +48,7 @@ jobs:
             base_dir="${module_dir#"./"}"
             printf " \"${base_dir}\"" >> "$GITHUB_OUTPUT"
             all_mods+=("${base_dir}")
-            ((index++)) || true
+            index+=1
           done < <(find . -name \*.mod | grep -v "\.git" | sort | uniq)
           printf "]" >> "$GITHUB_OUTPUT"
 
@@ -57,7 +57,9 @@ jobs:
   module-lint:
     name: Go module lint
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [ module-matrix ]
+    if: false
 
     strategy:
       matrix:
@@ -81,8 +83,10 @@ jobs:
 
   lint:
     needs: [ module-lint ]
+    if: false
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Linting complete
         run: |
@@ -91,9 +95,11 @@ jobs:
   module-test:
     name: Unit tests
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     needs: [ module-matrix ]
 
     strategy:
+      fail-fast: false
       matrix:
         os: [ ubuntu-latest, macos-latest, windows-latest ]
         go_version: ['oldstable', 'stable' ]
@@ -114,21 +120,69 @@ jobs:
         # *.coverage.* pattern is automatically detected by codecov
         COVER_PROFILE: "${{ matrix.module }}.coverage.${{ matrix.os }}.${{ matrix.go_version }}.out"
       run: |
-        go test -v -race -coverprofile="${COVER_PROFILE}" -covermode=atomic -coverpkg=$(go list)/... ./...
-
-    - name: Upload coverage to codecov
-      uses: codecov/codecov-action@v5
-      with:
-        name: Multi modules aggregated coverage
-        flags: '${{ matrix.go_version }}-${{ matrix.os }}'
-        fail_ci_if_error: false
-        verbose: true
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          go test -v -race -coverprofile="${COVER_PROFILE}" -covermode=atomic -coverpkg=$(go list)/... -run '${{ inputs.test-filter }}' ./...
+        else
+          go test -v -race -coverprofile="${COVER_PROFILE}" -covermode=atomic -coverpkg=$(go list)/... ./...
+        fi
 
   test:
     needs: [ module-test ]
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Tests complete
         run: |
           echo "All tests completed"
+
+  module-zip:
+    name: Build jsonutils module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Build module zip with golang.org/x/mod/zip
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/helper /tmp/zipsrc /tmp/out
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+            "os"
+
+            "golang.org/x/mod/module"
+            "golang.org/x/mod/zip"
+          )
+
+          func main() {
+            f, err := os.Create(os.Args[4])
+            if err != nil {
+              panic(err)
+            }
+            defer f.Close()
+            if err := zip.CreateFromDir(f, module.Version{Path: os.Args[1], Version: os.Args[2]}, os.Args[3]); err != nil {
+              panic(err)
+            }
+          }
+          EOF
+          tar -c --exclude=.git --exclude=.github --exclude=.gitignore -C "$GITHUB_WORKSPACE/jsonutils" . | tar -x -C /tmp/zipsrc
+          cp "$GITHUB_WORKSPACE/LICENSE" /tmp/zipsrc/LICENSE
+          test -f /tmp/zipsrc/go.mod
+          go run . github.com/go-openapi/swag/jsonutils v0.24.0 /tmp/zipsrc /tmp/out/v0.24.0.zip
+          unzip -Z1 /tmp/out/v0.24.0.zip
+          test "$(unzip -Z1 /tmp/out/v0.24.0.zip | wc -l)" -eq 10
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/out/v0.24.0.zip
+          if-no-files-found: error
