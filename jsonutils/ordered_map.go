@@ -15,12 +15,26 @@
 package jsonutils
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 
 	"github.com/mailru/easyjson/jlexer"
 	"github.com/mailru/easyjson/jwriter"
 )
+
+// defaultMaxNestingDepth is the default maximum number of nested JSON containers
+// ('{' or '[') that the ordered-JSON marshaler and unmarshaler will process before
+// returning an error.
+//
+// It mirrors the limit enforced by the standard library's [encoding/json] decoder,
+// guarding against stack-overflow crashes on deeply nested (possibly adversarial) input.
+const defaultMaxNestingDepth = 10000
+
+// ErrMaxNestingDepth is returned when a JSON document or in-memory structure nests
+// deeper than the maximum supported depth. It guards against stack-overflow crashes
+// on adversarially deep input.
+var ErrMaxNestingDepth = errors.New("maximum JSON nesting depth exceeded")
 
 // JSONMapSlice represents a JSON object, with the order of keys maintained.
 type JSONMapSlice []JSONMapItem
@@ -35,28 +49,7 @@ func (s JSONMapSlice) MarshalJSON() ([]byte, error) {
 
 // MarshalEasyJSON renders a [JSONMapSlice] as JSON bytes, using easyJSON
 func (s JSONMapSlice) MarshalEasyJSON(w *jwriter.Writer) {
-	if s == nil {
-		w.RawString("null")
-
-		return
-	}
-
-	w.RawByte('{')
-
-	if len(s) == 0 {
-		w.RawByte('}')
-
-		return
-	}
-
-	s[0].MarshalEasyJSON(w)
-
-	for i := 1; i < len(s); i++ {
-		w.RawByte(',')
-		s[i].MarshalEasyJSON(w)
-	}
-
-	w.RawByte('}')
+	s.marshalEasyJSON(w, defaultMaxNestingDepth)
 }
 
 // UnmarshalJSON builds a [JSONMapSlice] from JSON bytes, preserving the order of keys.
@@ -71,8 +64,53 @@ func (s *JSONMapSlice) UnmarshalJSON(data []byte) error {
 
 // UnmarshalEasyJSON builds a [JSONMapSlice] from JSON bytes, using easyJSON
 func (s *JSONMapSlice) UnmarshalEasyJSON(in *jlexer.Lexer) {
+	s.unmarshalEasyJSON(in, defaultMaxNestingDepth)
+}
+
+// marshalEasyJSON writes the object to w, decreasing budget for every nested container
+// to guard against stack overflow on deeply nested structures.
+func (s JSONMapSlice) marshalEasyJSON(w *jwriter.Writer, budget int) {
+	if s == nil {
+		w.RawString("null")
+
+		return
+	}
+
+	if budget <= 0 {
+		w.Error = ErrMaxNestingDepth
+
+		return
+	}
+
+	w.RawByte('{')
+
+	if len(s) == 0 {
+		w.RawByte('}')
+
+		return
+	}
+
+	s[0].marshalEasyJSON(w, budget)
+
+	for i := 1; i < len(s); i++ {
+		w.RawByte(',')
+		s[i].marshalEasyJSON(w, budget)
+	}
+
+	w.RawByte('}')
+}
+
+// unmarshalEasyJSON parses an object, decreasing budget for every nested container
+// so that adversarially deep documents return an error instead of overflowing the stack.
+func (s *JSONMapSlice) unmarshalEasyJSON(in *jlexer.Lexer, budget int) {
 	if in.IsNull() {
 		in.Skip()
+
+		return
+	}
+
+	if budget <= 0 {
+		in.AddError(ErrMaxNestingDepth)
 
 		return
 	}
@@ -81,7 +119,7 @@ func (s *JSONMapSlice) UnmarshalEasyJSON(in *jlexer.Lexer) {
 	in.Delim('{')
 	for !in.IsDelim('}') {
 		var mi JSONMapItem
-		mi.UnmarshalEasyJSON(in)
+		mi.unmarshalEasyJSON(in, budget)
 		result = append(result, mi)
 	}
 	in.Delim('}')
@@ -100,16 +138,33 @@ type JSONMapItem struct {
 
 // MarshalEasyJSON renders a [JSONMapItem] as JSON bytes, using easyJSON
 func (s JSONMapItem) MarshalEasyJSON(w *jwriter.Writer) {
-	w.String(s.Key)
-	w.RawByte(':')
-	w.Raw(WriteJSON(s.Value))
+	s.marshalEasyJSON(w, defaultMaxNestingDepth)
 }
 
 // UnmarshalEasyJSON builds a [JSONMapItem] from JSON bytes, using easyJSON
 func (s *JSONMapItem) UnmarshalEasyJSON(in *jlexer.Lexer) {
+	s.unmarshalEasyJSON(in, defaultMaxNestingDepth)
+}
+
+func (s JSONMapItem) marshalEasyJSON(w *jwriter.Writer, budget int) {
+	w.String(s.Key)
+	w.RawByte(':')
+
+	// Recurse internally for nested ordered maps so the depth guard survives, instead
+	// of dispatching to MarshalEasyJSON which would reset it and re-enable overflow.
+	if nested, ok := s.Value.(JSONMapSlice); ok {
+		nested.marshalEasyJSON(w, budget-1)
+
+		return
+	}
+
+	w.Raw(WriteJSON(s.Value))
+}
+
+func (s *JSONMapItem) unmarshalEasyJSON(in *jlexer.Lexer, budget int) {
 	key := in.UnsafeString()
 	in.WantColon()
-	value := s.asInterface(in)
+	value := s.asInterface(in, budget-1)
 	in.WantComma()
 
 	s.Key = key
@@ -121,7 +176,7 @@ func (s *JSONMapItem) UnmarshalEasyJSON(in *jlexer.Lexer) {
 //
 // We have to force parsing errors somehow, since [jlexer.Lexer] doesn't let us
 // set a parsing error directly.
-func (s *JSONMapItem) asInterface(in *jlexer.Lexer) any {
+func (s *JSONMapItem) asInterface(in *jlexer.Lexer, budget int) any {
 	tokenKind := in.CurrentToken()
 
 	if !in.Ok() {
@@ -153,7 +208,7 @@ func (s *JSONMapItem) asInterface(in *jlexer.Lexer) any {
 	case jlexer.TokenDelim:
 		if in.IsDelim('{') {
 			ret := make(JSONMapSlice, 0)
-			ret.UnmarshalEasyJSON(in)
+			ret.unmarshalEasyJSON(in, budget)
 
 			if in.Ok() {
 				return ret
@@ -164,11 +219,17 @@ func (s *JSONMapItem) asInterface(in *jlexer.Lexer) any {
 		}
 
 		if in.IsDelim('[') {
+			if budget <= 0 {
+				in.AddError(ErrMaxNestingDepth)
+
+				return nil
+			}
+
 			in.Delim('[') // consume
 
 			ret := []interface{}{}
 			for !in.IsDelim(']') {
-				ret = append(ret, s.asInterface(in))
+				ret = append(ret, s.asInterface(in, budget-1))
 				in.WantComma()
 			}
 			in.Delim(']')

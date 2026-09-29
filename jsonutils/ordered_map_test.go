@@ -16,9 +16,11 @@ package jsonutils
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/mailru/easyjson/jlexer"
+	"github.com/mailru/easyjson/jwriter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -205,5 +207,145 @@ func TestJSONMapSlice(t *testing.T) {
 			data.UnmarshalEasyJSON(&l)
 			require.Error(t, l.Error())
 		})
+	})
+}
+
+// deepObject builds a JSON document nesting depth objects: {"a":{"a":...{}...}}.
+func deepObject(depth int) []byte {
+	return []byte(strings.Repeat(`{"a":`, depth) + `{}` + strings.Repeat(`}`, depth))
+}
+
+// deepArray builds a JSON document nesting depth arrays under one key: {"a":[[...[]...]]}.
+func deepArray(depth int) []byte {
+	return []byte(`{"a":` + strings.Repeat(`[`, depth) + strings.Repeat(`]`, depth) + `}`)
+}
+
+// deepMapSlice builds an in-memory JSONMapSlice nested depth levels deep.
+func deepMapSlice(depth int) JSONMapSlice {
+	m := JSONMapSlice{{Key: "leaf", Value: "x"}}
+	for i := 0; i < depth; i++ {
+		m = JSONMapSlice{{Key: "n", Value: m}}
+	}
+
+	return m
+}
+
+func TestMaxNestingDepthUnmarshal(t *testing.T) {
+	t.Run("object nesting within the limit should unmarshal", func(t *testing.T) {
+		var m JSONMapSlice
+		require.NoError(t, m.UnmarshalJSON(deepObject(100)))
+	})
+
+	t.Run("object nesting at the default limit should unmarshal", func(t *testing.T) {
+		var m JSONMapSlice
+		require.NoError(t, m.UnmarshalJSON(deepObject(defaultMaxNestingDepth-1)))
+	})
+
+	t.Run("object nesting just beyond the default limit should error", func(t *testing.T) {
+		var m JSONMapSlice
+		err := m.UnmarshalJSON(deepObject(defaultMaxNestingDepth))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("object nesting beyond the default limit should error, not crash", func(t *testing.T) {
+		var m JSONMapSlice
+		err := m.UnmarshalJSON(deepObject(defaultMaxNestingDepth + 5))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("array nesting at the default limit should unmarshal", func(t *testing.T) {
+		var m JSONMapSlice
+		require.NoError(t, m.UnmarshalJSON(deepArray(defaultMaxNestingDepth-1)))
+	})
+
+	t.Run("array nesting beyond the default limit should error, not crash", func(t *testing.T) {
+		var m JSONMapSlice
+		err := m.UnmarshalJSON(deepArray(defaultMaxNestingDepth + 5))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("mixed object and array nesting beyond the default limit should error, not crash", func(t *testing.T) {
+		const depth = defaultMaxNestingDepth
+		payload := []byte(strings.Repeat(`{"a":[`, depth) + `{}` + strings.Repeat(`]}`, depth))
+
+		var m JSONMapSlice
+		err := m.UnmarshalJSON(payload)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("UnmarshalEasyJSON beyond the default limit should error, not crash", func(t *testing.T) {
+		var m JSONMapSlice
+		l := jlexer.Lexer{Data: deepArray(defaultMaxNestingDepth + 5)}
+		m.UnmarshalEasyJSON(&l)
+		require.Error(t, l.Error())
+		assert.ErrorIs(t, l.Error(), ErrMaxNestingDepth)
+	})
+
+	t.Run("json.Unmarshal path beyond the default limit should error, not crash", func(t *testing.T) {
+		var m JSONMapSlice
+		require.Error(t, json.Unmarshal(deepObject(defaultMaxNestingDepth+5), &m))
+	})
+
+	t.Run("configurable limit should be honored", func(t *testing.T) {
+		const maxDepth = 5
+
+		var okMap JSONMapSlice
+		okLexer := jlexer.Lexer{Data: deepObject(4)}
+		okMap.unmarshalEasyJSON(&okLexer, maxDepth)
+		require.NoError(t, okLexer.Error())
+
+		var badMap JSONMapSlice
+		badLexer := jlexer.Lexer{Data: deepObject(10)}
+		badMap.unmarshalEasyJSON(&badLexer, maxDepth)
+		require.Error(t, badLexer.Error())
+		assert.ErrorIs(t, badLexer.Error(), ErrMaxNestingDepth)
+	})
+}
+
+func TestMaxNestingDepthMarshal(t *testing.T) {
+	t.Run("MarshalJSON beyond the default limit should error, not crash", func(t *testing.T) {
+		_, err := deepMapSlice(defaultMaxNestingDepth + 5).MarshalJSON()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("MarshalJSON within the limit should marshal", func(t *testing.T) {
+		_, err := deepMapSlice(100).MarshalJSON()
+		require.NoError(t, err)
+	})
+
+	t.Run("MarshalEasyJSON beyond the default limit should error, not crash", func(t *testing.T) {
+		w := &jwriter.Writer{}
+		deepMapSlice(defaultMaxNestingDepth + 5).MarshalEasyJSON(w)
+		_, err := w.BuildBytes()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("json.Marshal path beyond the default limit should error, not crash", func(t *testing.T) {
+		_, err := json.Marshal(deepMapSlice(defaultMaxNestingDepth + 5))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("document accepted by the unmarshaler should marshal back", func(t *testing.T) {
+		var m JSONMapSlice
+		require.NoError(t, m.UnmarshalJSON(deepObject(defaultMaxNestingDepth-1)))
+
+		b, err := m.MarshalJSON()
+		require.NoError(t, err)
+		assert.Equal(t, string(deepObject(defaultMaxNestingDepth-1)), string(b))
+	})
+
+	t.Run("configurable limit should be honored", func(t *testing.T) {
+		w := &jwriter.Writer{}
+		deepMapSlice(10).marshalEasyJSON(w, 5)
+		_, err := w.BuildBytes()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
 	})
 }

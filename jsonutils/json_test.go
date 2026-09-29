@@ -16,6 +16,7 @@ package jsonutils
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -178,5 +179,65 @@ func TestReadWriteJSON(t *testing.T) {
 			}
 			require.Error(t, FromDynamicJSON(source, obj2))
 		})
+	})
+}
+
+// TestReadJSONDeepNestingDoesNotCrash exercises the advisory scenario end-to-end:
+// a deeply nested document must return an error instead of driving the runtime to a
+// non-recoverable stack overflow (CWE-674, unchecked recursion).
+func TestReadJSONDeepNestingDoesNotCrash(t *testing.T) {
+	t.Run("deeply nested arrays should error, not crash", func(t *testing.T) {
+		const depth = 20000 // well beyond the default 10000 limit
+		payload := []byte(`{"a":` + strings.Repeat("[", depth) + strings.Repeat("]", depth) + `}`)
+
+		var v JSONMapSlice
+		require.Error(t, ReadJSON(payload, &v))
+	})
+
+	t.Run("deeply nested objects should error, not crash", func(t *testing.T) {
+		const depth = 20000
+		payload := []byte(strings.Repeat(`{"a":`, depth) + `{}` + strings.Repeat(`}`, depth))
+
+		var v JSONMapSlice
+		require.Error(t, ReadJSON(payload, &v))
+	})
+
+	t.Run("adversarial multi-megabyte nesting should error, not overflow the stack", func(t *testing.T) {
+		// without a depth guard, this many nested containers exhausts the goroutine stack
+		// limit and aborts the whole process with a fatal, non-recoverable error.
+		const depth = 10_000_000
+		payload := []byte(`{"a":` + strings.Repeat("[", depth))
+
+		var v JSONMapSlice
+		err := ReadJSON(payload, &v)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrMaxNestingDepth)
+	})
+
+	t.Run("moderately nested document should round-trip cleanly", func(t *testing.T) {
+		const depth = 200
+		payload := []byte(strings.Repeat(`{"a":`, depth) + `{}` + strings.Repeat(`}`, depth))
+
+		var v JSONMapSlice
+		require.NoError(t, ReadJSON(payload, &v))
+
+		b, err := WriteJSON(v)
+		require.NoError(t, err)
+		assert.Equal(t, string(payload), string(b))
+	})
+}
+
+// TestWriteJSONDeepNestingDoesNotCrash covers the marshal path: a deep in-memory
+// JSONMapSlice must error rather than overflow the stack.
+func TestWriteJSONDeepNestingDoesNotCrash(t *testing.T) {
+	t.Run("deeply nested value should error, not crash", func(t *testing.T) {
+		const depth = 20000
+		v := JSONMapSlice{{Key: "leaf", Value: "x"}}
+		for i := 0; i < depth; i++ {
+			v = JSONMapSlice{{Key: "n", Value: v}}
+		}
+
+		_, err := WriteJSON(v)
+		require.Error(t, err)
 	})
 }
